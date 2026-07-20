@@ -3,7 +3,8 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
 # ---------------- 기본 설정 ----------------
 st.set_page_config(
@@ -39,7 +40,21 @@ STOCKS = {
     "TSMC (TSM)": "TSM",
 }
 
-ALL_TICKERS = {**INDICES, **STOCKS}
+# ---------------- 재시도 유틸 ----------------
+def fetch_with_retry(func, max_retries=3, base_delay=2):
+    """Rate limit(429) 발생 시 지수적으로 대기하며 재시도"""
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            if result is None or (hasattr(result, "empty") and result.empty):
+                raise ValueError("empty data")
+            return result
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            wait = base_delay * (2 ** attempt)
+            time.sleep(wait)
+    return None
 
 # ---------------- 사이드바 ----------------
 st.sidebar.title("⚙️ 설정")
@@ -73,50 +88,59 @@ show_volume = st.sidebar.checkbox("거래량 표시", value=True)
 show_ma = st.sidebar.checkbox("이동평균선 표시 (20, 60일)", value=True)
 
 st.sidebar.markdown("---")
+if st.sidebar.button("🔄 새로고침 (캐시 초기화)"):
+    st.cache_data.clear()
+    st.rerun()
 st.sidebar.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------------- 데이터 로드 ----------------
-@st.cache_data(ttl=300)
+# ---------------- 개별 종목 데이터 로드 (캐시 10분) ----------------
+@st.cache_data(ttl=600, show_spinner="데이터 불러오는 중...")
 def load_data(ticker_symbol, period):
-    data = yf.Ticker(ticker_symbol)
-    hist = data.history(period=period)
-    info = data.info
-    return hist, info
+    def _fetch():
+        data = yf.Ticker(ticker_symbol)
+        hist = data.history(period=period)
+        return hist
+    hist = fetch_with_retry(_fetch)
+    return hist
+
+# ---------------- 지수 개요 배치 로드 (캐시 10분, 1회 요청으로 처리) ----------------
+@st.cache_data(ttl=600, show_spinner=False)
+def load_overview(tickers_dict):
+    def _fetch():
+        tickers = list(tickers_dict.values())
+        # 여러 티커를 한 번의 요청으로 묶어서 호출 (호출 수 최소화)
+        data = yf.download(tickers, period="5d", group_by="ticker", progress=False, threads=False)
+        return data
+    return fetch_with_retry(_fetch)
 
 st.title("📈 글로벌 주식 대시보드")
 st.caption("Yahoo Finance 데이터 기반 실시간(지연) 시세 대시보드")
 
 try:
-    hist, info = load_data(ticker, period)
+    hist = load_data(ticker, period)
 
-    if hist.empty:
-        st.error("데이터를 불러올 수 없습니다. 티커를 확인해주세요.")
+    if hist is None or hist.empty:
+        st.warning("데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요. (Yahoo Finance 요청 제한일 수 있습니다)")
     else:
-        # ---------------- 상단 요약 지표 ----------------
         current_price = hist["Close"].iloc[-1]
         prev_price = hist["Close"].iloc[-2] if len(hist) > 1 else current_price
         change = current_price - prev_price
         change_pct = (change / prev_price) * 100 if prev_price != 0 else 0
 
-        high_52w = hist["High"].max()
-        low_52w = hist["Low"].min()
+        high_period = hist["High"].max()
+        low_period = hist["Low"].min()
         avg_volume = hist["Volume"].mean()
 
         st.subheader(f"{name}")
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric(
-            "현재가",
-            f"{current_price:,.2f}",
-            f"{change:+.2f} ({change_pct:+.2f}%)"
-        )
-        col2.metric("기간 최고가", f"{high_52w:,.2f}")
-        col3.metric("기간 최저가", f"{low_52w:,.2f}")
+        col1.metric("현재가", f"{current_price:,.2f}", f"{change:+.2f} ({change_pct:+.2f}%)")
+        col2.metric("기간 최고가", f"{high_period:,.2f}")
+        col3.metric("기간 최저가", f"{low_period:,.2f}")
         col4.metric("평균 거래량", f"{avg_volume:,.0f}")
 
         st.markdown("---")
 
-        # ---------------- 차트 ----------------
         rows = 2 if show_volume else 1
         row_heights = [0.7, 0.3] if show_volume else [1.0]
 
@@ -130,26 +154,16 @@ try:
         if chart_type == "캔들스틱":
             fig.add_trace(
                 go.Candlestick(
-                    x=hist.index,
-                    open=hist["Open"],
-                    high=hist["High"],
-                    low=hist["Low"],
-                    close=hist["Close"],
-                    name="가격",
-                    increasing_line_color="#ef4444",
-                    decreasing_line_color="#3b82f6",
+                    x=hist.index, open=hist["Open"], high=hist["High"],
+                    low=hist["Low"], close=hist["Close"], name="가격",
+                    increasing_line_color="#ef4444", decreasing_line_color="#3b82f6",
                 ),
                 row=1, col=1
             )
         else:
             fig.add_trace(
-                go.Scatter(
-                    x=hist.index,
-                    y=hist["Close"],
-                    mode="lines",
-                    name="종가",
-                    line=dict(color="#6366f1", width=2)
-                ),
+                go.Scatter(x=hist.index, y=hist["Close"], mode="lines",
+                           name="종가", line=dict(color="#6366f1", width=2)),
                 row=1, col=1
             )
 
@@ -185,28 +199,36 @@ try:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------------- 데이터 테이블 ----------------
         with st.expander("📋 원본 데이터 보기"):
             st.dataframe(hist.sort_index(ascending=False), use_container_width=True)
 
 except Exception as e:
-    st.error(f"오류가 발생했습니다: {e}")
-    st.info("티커 심볼이 올바른지 확인해주세요. (예: 미국 AAPL, 한국 005930.KS)")
+    st.error("요청이 제한되었거나(Rate Limit) 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
+    st.caption(f"상세 오류: {e}")
 
 st.markdown("---")
 
-# ---------------- 글로벌 지수 한눈에 보기 ----------------
+# ---------------- 글로벌 지수 한눈에 보기 (배치 호출) ----------------
 st.subheader("🌍 글로벌 주요 지수 한눈에 보기")
 
-cols = st.columns(5)
-for i, (idx_name, idx_ticker) in enumerate(INDICES.items()):
-    try:
-        idx_data = yf.Ticker(idx_ticker).history(period="5d")
-        if not idx_data.empty and len(idx_data) > 1:
-            last = idx_data["Close"].iloc[-1]
-            prev = idx_data["Close"].iloc[-2]
-            pct = ((last - prev) / prev) * 100
-            with cols[i % 5]:
-                st.metric(idx_name, f"{last:,.1f}", f"{pct:+.2f}%")
-    except Exception:
-        pass
+try:
+    overview_data = load_overview(INDICES)
+
+    if overview_data is not None and not overview_data.empty:
+        cols = st.columns(5)
+        for i, (idx_name, idx_ticker) in enumerate(INDICES.items()):
+            try:
+                closes = overview_data[idx_ticker]["Close"].dropna()
+                if len(closes) > 1:
+                    last = closes.iloc[-1]
+                    prev = closes.iloc[-2]
+                    pct = ((last - prev) / prev) * 100
+                    with cols[i % 5]:
+                        st.metric(idx_name, f"{last:,.1f}", f"{pct:+.2f}%")
+            except Exception:
+                with cols[i % 5]:
+                    st.caption(f"{idx_name}: 데이터 없음")
+    else:
+        st.info("지수 개요를 불러올 수 없습니다. (요청 제한) 잠시 후 새로고침 버튼을 눌러주세요.")
+except Exception as e:
+    st.info("지수 개요를 불러오는 중 요청 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
